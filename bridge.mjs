@@ -1,16 +1,20 @@
 import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { readFileSync, writeFileSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, statSync, renameSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 // --- Config ---
 const PORT = parseInt(process.env.CODEX_BRIDGE_PORT || "18080");
 const AUTH_PATH = join(homedir(), ".codex", "auth.json");
+const LOG_PATH = join(homedir(), ".codex", "bridge.log");
 const UPSTREAM_HOST = "chatgpt.com";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
-const REFRESH_BUFFER_SEC = 120; // refresh 2min before expiry
+const REFRESH_BUFFER_SEC = 120;
+const UPSTREAM_TIMEOUT_MS = 120_000;
+const BODY_MAX_BYTES = 10 * 1024 * 1024;
+const BODY_TIMEOUT_MS = 30_000;
 
 // --- State ---
 const state = {
@@ -21,17 +25,38 @@ const state = {
   fileMtime: 0,
 };
 
-let refreshLock = null; // prevents concurrent refreshes
+let refreshLock = null;
+
+// --- Logging (stdout + file) ---
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `[${ts.slice(11, 19)}] ${msg}`;
+  console.log(line);
+  try {
+    appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
+  } catch {}
+}
+
+// --- Global error handlers (prevent silent crashes under nohup) ---
+
+process.on("uncaughtException", (err) => {
+  log(`UNCAUGHT EXCEPTION: ${err.stack || err.message}`);
+});
+process.on("unhandledRejection", (reason) => {
+  log(`UNHANDLED REJECTION: ${reason instanceof Error ? reason.stack : reason}`);
+});
 
 // --- Token management ---
 
 function decodeExp(jwt) {
-  const seg = jwt.split(".")[1];
-  const padded = seg + "=".repeat((4 - (seg.length % 4)) % 4);
-  const payload = JSON.parse(
-    Buffer.from(padded, "base64").toString("utf8")
-  );
-  return payload.exp;
+  try {
+    const seg = jwt.split(".")[1];
+    const padded = seg + "=".repeat((4 - (seg.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8")).exp;
+  } catch {
+    throw new Error("Failed to decode JWT — token may be corrupt");
+  }
 }
 
 function loadAuth() {
@@ -43,7 +68,13 @@ function loadAuth() {
   }
   if (mtime === state.fileMtime && state.accessToken) return;
 
-  const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+  } catch (e) {
+    throw new Error(`Failed to parse auth.json (may be mid-write): ${e.message}`);
+  }
+
   if (!raw.tokens?.access_token) {
     throw new Error("No access_token in auth.json — run `codex` and log in first");
   }
@@ -58,8 +89,13 @@ function isExpired() {
   return Math.floor(Date.now() / 1000) >= state.exp - REFRESH_BUFFER_SEC;
 }
 
+function atomicWriteJson(filepath, data) {
+  const tmp = filepath + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, filepath);
+}
+
 async function doRefresh() {
-  // Re-read file first — Codex CLI may have refreshed already
   state.fileMtime = 0;
   loadAuth();
   if (!isExpired()) {
@@ -74,11 +110,17 @@ async function doRefresh() {
     client_id: CLIENT_ID,
   });
 
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
+  let res;
+  try {
+    res = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e) {
+    throw new Error(`token refresh network error: ${e.message}`);
+  }
 
   if (!res.ok) {
     const text = await res.text();
@@ -90,13 +132,16 @@ async function doRefresh() {
   if (data.refresh_token) state.refreshToken = data.refresh_token;
   state.exp = decodeExp(state.accessToken);
 
-  // Write back to auth.json so Codex CLI also sees the new tokens
-  const authFile = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
-  authFile.tokens.access_token = state.accessToken;
-  if (data.refresh_token) authFile.tokens.refresh_token = state.refreshToken;
-  authFile.last_refresh = new Date().toISOString();
-  writeFileSync(AUTH_PATH, JSON.stringify(authFile, null, 2));
-  state.fileMtime = statSync(AUTH_PATH).mtimeMs;
+  try {
+    const authFile = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+    authFile.tokens.access_token = state.accessToken;
+    if (data.refresh_token) authFile.tokens.refresh_token = state.refreshToken;
+    authFile.last_refresh = new Date().toISOString();
+    atomicWriteJson(AUTH_PATH, authFile);
+    state.fileMtime = statSync(AUTH_PATH).mtimeMs;
+  } catch (e) {
+    log(`warning: could not write back auth.json: ${e.message}`);
+  }
 
   log(`refreshed — expires ${new Date(state.exp * 1000).toISOString()}`);
 }
@@ -105,7 +150,6 @@ async function ensureToken() {
   loadAuth();
   if (!isExpired()) return;
 
-  // Serialize concurrent refresh attempts
   if (refreshLock) return refreshLock;
   refreshLock = doRefresh().finally(() => {
     refreshLock = null;
@@ -115,21 +159,38 @@ async function ensureToken() {
 
 // --- Helpers ---
 
-function log(msg) {
-  const ts = new Date().toISOString().slice(11, 19);
-  console.log(`[${ts}] ${msg}`);
-}
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    let size = 0;
+    const timer = setTimeout(() => {
+      req.destroy();
+      reject(new Error("request body read timed out"));
+    }, BODY_TIMEOUT_MS);
+
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > BODY_MAX_BYTES) {
+        clearTimeout(timer);
+        req.destroy();
+        reject(new Error("request body too large"));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      clearTimeout(timer);
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
   });
 }
 
 function jsonRes(res, status, obj) {
+  if (res.headersSent) return;
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
 }
@@ -137,7 +198,6 @@ function jsonRes(res, status, obj) {
 // --- Server ---
 
 const server = createServer(async (req, res) => {
-  // Health
   if (req.method === "GET" && req.url === "/health") {
     try {
       loadAuth();
@@ -152,7 +212,6 @@ const server = createServer(async (req, res) => {
     });
   }
 
-  // Minimal /v1/models for tool compatibility
   if (req.method === "GET" && req.url === "/v1/models") {
     return jsonRes(res, 200, {
       object: "list",
@@ -172,9 +231,14 @@ const server = createServer(async (req, res) => {
     return jsonRes(res, 502, { error: { message: e.message } });
   }
 
-  let body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    log(`body read error: ${e.message}`);
+    return jsonRes(res, 400, { error: { message: e.message } });
+  }
 
-  // Path rewrite: /v1/responses → /backend-api/codex/responses
   let upstreamPath = req.url;
   if (upstreamPath.startsWith("/v1/")) {
     upstreamPath = "/backend-api/codex/" + upstreamPath.slice(4);
@@ -182,16 +246,10 @@ const server = createServer(async (req, res) => {
     upstreamPath = "/backend-api/codex";
   }
 
-  // Patch request body for Codex backend-api compatibility.
-  // The Codex backend (chatgpt.com/backend-api/codex/responses) is stricter
-  // than the standard OpenAI Responses API (api.openai.com/v1/responses).
-  // OpenClaw's openai-codex-responses transport applies similar patches.
   if (body.length > 0 && upstreamPath.endsWith("/responses")) {
     try {
       const src = JSON.parse(body.toString("utf8"));
 
-      // Rebuild body to match pi-ai's buildRequestBody exactly.
-      // Only include fields the Codex backend-api accepts.
       const patched = {
         model: src.model,
         store: false,
@@ -203,23 +261,18 @@ const server = createServer(async (req, res) => {
         parallel_tool_calls: src.parallel_tool_calls ?? true,
       };
 
-      // instructions = system prompt (Codex uses this instead of system message in input)
       if (src.instructions) patched.instructions = src.instructions;
-
-      // Optional fields pi-ai conditionally includes
       if (src.tools) patched.tools = src.tools;
       if (src.temperature !== undefined) patched.temperature = src.temperature;
       if (src.reasoning) patched.reasoning = src.reasoning;
 
       body = Buffer.from(JSON.stringify(patched), "utf8");
-      log(`patched body: model=${patched.model} keys=[${Object.keys(patched)}]`);
+      log(`patched: model=${patched.model} keys=[${Object.keys(patched)}]`);
     } catch (e) {
-      log(`body patch skipped (not JSON): ${e.message}`);
+      log(`body patch skipped: ${e.message}`);
     }
   }
 
-  // Match pi-ai's buildSSEHeaders + buildBaseCodexHeaders exactly.
-  // See: @mariozechner/pi-ai/dist/providers/openai-codex-responses.js
   const upstreamHeaders = {
     Authorization: `Bearer ${state.accessToken}`,
     "chatgpt-account-id": state.accountId,
@@ -231,12 +284,11 @@ const server = createServer(async (req, res) => {
     "User-Agent": `pi (${process.platform} ${process.arch})`,
   };
 
-  // Always recalculate content-length after body patch
   if (body.length > 0) {
     upstreamHeaders["Content-Length"] = body.length;
   }
 
-  log(`${req.method} ${req.url} → ${UPSTREAM_HOST}${upstreamPath}`);
+  log(`→ ${req.method} ${upstreamPath}`);
 
   const upstream = httpsRequest(
     {
@@ -245,9 +297,9 @@ const server = createServer(async (req, res) => {
       path: upstreamPath,
       method: req.method,
       headers: upstreamHeaders,
+      timeout: UPSTREAM_TIMEOUT_MS,
     },
     (upstreamRes) => {
-      // Forward headers, skip hop-by-hop
       const skip = new Set([
         "connection",
         "keep-alive",
@@ -266,16 +318,42 @@ const server = createServer(async (req, res) => {
     }
   );
 
+  upstream.on("timeout", () => {
+    log("upstream timeout — aborting");
+    upstream.destroy(new Error("upstream timeout"));
+  });
+
   upstream.on("error", (e) => {
     log(`upstream error: ${e.message}`);
-    if (!res.headersSent) {
-      jsonRes(res, 502, { error: { message: `upstream: ${e.message}` } });
-    }
+    jsonRes(res, 502, { error: { message: `upstream: ${e.message}` } });
+  });
+
+  // Abort upstream if client disconnects early
+  res.on("close", () => {
+    if (!upstream.destroyed) upstream.destroy();
   });
 
   if (body.length > 0) upstream.write(body);
   upstream.end();
 });
+
+// --- EADDRINUSE ---
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`[fatal] port ${PORT} already in use — is another bridge running?`);
+    process.exit(1);
+  }
+  log(`server error: ${e.message}`);
+});
+
+// --- Graceful shutdown ---
+function shutdown(signal) {
+  log(`${signal} — shutting down`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 3000);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // --- Start ---
 try {
@@ -290,9 +368,5 @@ server.listen(PORT, "127.0.0.1", () => {
   log(`listening on http://127.0.0.1:${PORT}`);
   log(`account:  ${state.accountId}`);
   log(`expires:  ${new Date(state.exp * 1000).toISOString()}`);
-  log("");
-  log("Factory / tool config:");
-  log(`  baseUrl: http://127.0.0.1:${PORT}/v1`);
-  log(`  apiKey:  codex-bridge (any non-empty string)`);
-  log(`  provider: openai`);
+  log(`log file: ${LOG_PATH}`);
 });
