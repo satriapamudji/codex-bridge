@@ -28,16 +28,62 @@ const state = {
 
 let refreshLock = null;
 let idleTimer = null;
+let idleCheckInterval = null;
+
+import { execSync } from "node:child_process";
+
+function isDroidRunningSync() {
+  try {
+    const out = execSync(
+      process.platform === "win32"
+        ? 'tasklist /FI "IMAGENAME eq droid.exe" /NH'
+        : "pgrep -x droid",
+      { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    return process.platform === "win32" ? out.includes("droid.exe") : out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function startIdleWatch() {
+  if (IDLE_SHUTDOWN_MS <= 0) return;
+  if (idleCheckInterval) return;
+
+  // Check every 60s: if droid is gone AND idle timer hasn't started, start it.
+  // If droid comes back, cancel the idle timer.
+  idleCheckInterval = setInterval(() => {
+    if (isDroidRunningSync()) {
+      // Droid is up — cancel any pending idle shutdown
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    } else if (!idleTimer) {
+      // Droid is gone — start idle countdown
+      log(`droid not running — idle shutdown in ${IDLE_SHUTDOWN_MS / 60_000}min`);
+      idleTimer = setTimeout(() => {
+        // Double-check droid isn't back
+        if (isDroidRunningSync()) {
+          idleTimer = null;
+          return;
+        }
+        log("idle shutdown — droid not running");
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 3000);
+      }, IDLE_SHUTDOWN_MS);
+      idleTimer.unref();
+    }
+  }, 60_000);
+  idleCheckInterval.unref();
+}
 
 function resetIdleTimer() {
-  if (idleTimer) clearTimeout(idleTimer);
-  if (IDLE_SHUTDOWN_MS <= 0) return; // 0 = disabled
-  idleTimer = setTimeout(() => {
-    log(`idle for ${IDLE_SHUTDOWN_MS / 60_000}min — shutting down`);
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000);
-  }, IDLE_SHUTDOWN_MS);
-  idleTimer.unref(); // don't keep process alive just for the timer
+  // Any request resets the idle countdown
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
 }
 
 // --- Logging (stdout + file) ---
@@ -383,7 +429,7 @@ server.listen(PORT, "127.0.0.1", () => {
   log(`listening on http://127.0.0.1:${PORT}`);
   log(`account:  ${state.accountId}`);
   log(`expires:  ${new Date(state.exp * 1000).toISOString()}`);
-  log(`idle shutdown: ${IDLE_SHUTDOWN_MS > 0 ? IDLE_SHUTDOWN_MS / 60_000 + "min" : "disabled"}`);
+  log(`idle shutdown: ${IDLE_SHUTDOWN_MS > 0 ? IDLE_SHUTDOWN_MS / 60_000 + "min after droid exits" : "disabled"}`);
   log(`log file: ${LOG_PATH}`);
-  resetIdleTimer();
+  startIdleWatch();
 });
