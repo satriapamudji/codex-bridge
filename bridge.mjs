@@ -322,7 +322,8 @@ const server = createServer(async (req, res) => {
         parallel_tool_calls: src.parallel_tool_calls ?? true,
       };
 
-      if (src.instructions) patched.instructions = src.instructions;
+      // Codex backend requires instructions (system prompt) — default if missing
+      patched.instructions = src.instructions || "You are a helpful assistant.";
       if (src.tools) patched.tools = src.tools;
       if (src.temperature !== undefined) patched.temperature = src.temperature;
       if (src.reasoning) patched.reasoning = src.reasoning;
