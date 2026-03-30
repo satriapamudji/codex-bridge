@@ -15,6 +15,7 @@ const REFRESH_BUFFER_SEC = 120;
 const UPSTREAM_TIMEOUT_MS = 120_000;
 const BODY_MAX_BYTES = 10 * 1024 * 1024;
 const BODY_TIMEOUT_MS = 30_000;
+const IDLE_SHUTDOWN_MS = parseInt(process.env.CODEX_BRIDGE_IDLE_MIN || "10") * 60_000;
 
 // --- State ---
 const state = {
@@ -26,6 +27,18 @@ const state = {
 };
 
 let refreshLock = null;
+let idleTimer = null;
+
+function resetIdleTimer() {
+  if (idleTimer) clearTimeout(idleTimer);
+  if (IDLE_SHUTDOWN_MS <= 0) return; // 0 = disabled
+  idleTimer = setTimeout(() => {
+    log(`idle for ${IDLE_SHUTDOWN_MS / 60_000}min — shutting down`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000);
+  }, IDLE_SHUTDOWN_MS);
+  idleTimer.unref(); // don't keep process alive just for the timer
+}
 
 // --- Logging (stdout + file) ---
 
@@ -198,6 +211,8 @@ function jsonRes(res, status, obj) {
 // --- Server ---
 
 const server = createServer(async (req, res) => {
+  resetIdleTimer();
+
   if (req.method === "GET" && req.url === "/health") {
     try {
       loadAuth();
@@ -368,5 +383,7 @@ server.listen(PORT, "127.0.0.1", () => {
   log(`listening on http://127.0.0.1:${PORT}`);
   log(`account:  ${state.accountId}`);
   log(`expires:  ${new Date(state.exp * 1000).toISOString()}`);
+  log(`idle shutdown: ${IDLE_SHUTDOWN_MS > 0 ? IDLE_SHUTDOWN_MS / 60_000 + "min" : "disabled"}`);
   log(`log file: ${LOG_PATH}`);
+  resetIdleTimer();
 });
