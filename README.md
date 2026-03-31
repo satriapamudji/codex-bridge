@@ -2,14 +2,10 @@
 
 Local proxy that routes OpenAI Responses API requests through your Codex/ChatGPT subscription. Zero dependencies — just Node.js.
 
-**What it does:** Reads your Codex CLI OAuth tokens from `~/.codex/auth.json`, auto-refreshes when expired, and forwards requests to `chatgpt.com/backend-api/codex/responses` with the correct headers. Any tool that speaks the OpenAI Responses API can use your ChatGPT subscription instead of an API key.
-
-Derived from how [OpenClaw](https://github.com/openclaw/openclaw)'s `openai-codex-responses` transport works via [@mariozechner/pi-ai](https://github.com/mariozechner/pi-ai).
-
 ## Requirements
 
 - Node.js >= 18
-- [Codex CLI](https://github.com/openai/codex) logged in (`codex` → sign in with ChatGPT)
+- [Codex CLI](https://github.com/openai/codex) logged in (`codex` -> sign in with ChatGPT)
 
 ## Quick start
 
@@ -19,70 +15,93 @@ cd codex-bridge
 node bridge.mjs
 ```
 
-The proxy starts on `http://127.0.0.1:18080`. Configure your tool to point at it.
+The proxy listens on `http://127.0.0.1:18080` by default.
 
-## Tool configuration
+## Factory Droid settings
 
-### Factory Droid
+Run the one-time migration once to patch your live `~/.factory/settings.json` automatically:
 
-In `~/.factory/settings.json`, add to `customModels`:
-
-```json
-{
-  "model": "gpt-5.4",
-  "displayName": "GPT-5.4 (Codex Bridge)",
-  "baseUrl": "http://127.0.0.1:18080/v1",
-  "apiKey": "codex-bridge",
-  "provider": "openai",
-  "maxOutputTokens": 16384
-}
+```bash
+npm run migrate:factory
 ```
 
-### Cursor / Cline / any OpenAI-compatible tool
+This command only adds entries for models hosted by this bridge and leaves everything else untouched. It also keeps a timestamped backup file at `~/.factory/settings.json.bak-*` before making changes.
 
-- **Base URL:** `http://127.0.0.1:18080/v1`
-- **API Key:** `codex-bridge` (any non-empty string — the proxy handles auth)
-- **Provider:** OpenAI / OpenAI-compatible
+If you prefer manual edits, this is the equivalent block to include in `customModels` (or equivalent section):
 
-## Auto-start with droid
+```json
+[
+  {
+    "model": "gpt-5.4",
+    "displayName": "GPT-5.4 (Codex Bridge)",
+    "baseUrl": "http://127.0.0.1:18080/v1",
+    "apiKey": "codex-bridge",
+    "provider": "openai",
+    "maxOutputTokens": 16384
+  },
+  {
+    "model": "gpt-5.3-codex",
+    "displayName": "GPT-5.3 Codex (Codex Bridge)",
+    "baseUrl": "http://127.0.0.1:18080/v1",
+    "apiKey": "codex-bridge",
+    "provider": "openai",
+    "maxOutputTokens": 8192
+  },
+  {
+    "model": "gpt-5.3-codex-spark",
+    "displayName": "GPT-5.3 Codex Spark (Codex Bridge)",
+    "baseUrl": "http://127.0.0.1:18080/v1",
+    "apiKey": "codex-bridge",
+    "provider": "openai",
+    "maxOutputTokens": 8192
+  }
+]
+```
 
-Instead of starting the proxy manually, wrap your `droid` command.
+To inspect your settings after migration, use:
 
-### PowerShell (Windows)
+```bash
+jq '.customModels[] | select(.model | test("gpt-5\\.4|gpt-5\\.3-codex|gpt-5\\.3-codex-spark"))' ~/.factory/settings.json
+```
 
-Add to your `$PROFILE`:
+## Auto-start with droid (recommended)
+
+### `droid.ps1` (PowerShell)
+
+Use the wrapper script in `droid.ps1` and call it from your profile:
 
 ```powershell
 function droid {
-    $bridge = Start-Process node -ArgumentList "C:\path\to\codex-bridge\bridge.mjs" -WindowStyle Hidden -PassThru
-    Start-Sleep -Milliseconds 800
-    try {
-        & "C:\Users\spamu\bin\droid.exe" @args
-    } finally {
-        Stop-Process -Id $bridge.Id -Force 2>$null
-    }
+  & "C:\path\to\codex-bridge\droid.ps1" @args
 }
 ```
 
-### Bash / Zsh (macOS / Linux)
+If you need to force a specific binary, set:
 
-Add to `~/.zshrc` or `~/.bashrc`:
+```powershell
+$env:CODEX_DROID_CMD = "C:\Path\To\droid.exe"
+```
+
+### `droid.sh` (Bash / Zsh)
 
 ```bash
 droid() {
-    node ~/codex-bridge/bridge.mjs &
-    local pid=$!
-    trap "kill $pid 2>/dev/null" RETURN
-    sleep 0.8
-    command droid "$@"
+  /path/to/codex-bridge/droid.sh "$@"
 }
 ```
+
+Both wrappers now:
+
+- reuse an already-running bridge by checking `/health`
+- start a new bridge only if `/health` is unreachable
+- only stop the bridge they started
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEX_BRIDGE_PORT` | `18080` | Port the proxy listens on |
+| `CODEX_BRIDGE_PORT` | `18080` | Proxy listen port |
+| `CODEX_DROID_CMD` | (auto-detected) | Optional explicit `droid` command used by `droid.ps1` |
 
 ## Endpoints
 
@@ -90,16 +109,23 @@ droid() {
 |---|---|---|
 | `GET` | `/health` | Token status + expiry |
 | `GET` | `/v1/models` | Available models |
-| `POST` | `/v1/responses` | Proxied to Codex backend |
+| `POST` | `/v1/responses` | Proxied request to Codex backend |
+
+## Logging
+
+Bridge logs are written to `~/.codex/bridge.log`.
+
+- Linux/macOS: `tail -f ~/.codex/bridge.log`
+- `systemd` services: `journalctl -u <service> -f` for process lifecycle + `~/.codex/bridge.log` for request logs.
 
 ## How it works
 
 1. Reads OAuth tokens from `~/.codex/auth.json` (written by Codex CLI)
-2. On each request, checks JWT expiry (with 2-minute buffer)
-3. If expired, re-reads `auth.json` (Codex CLI may have refreshed it) — if still expired, refreshes via `auth.openai.com/oauth/token` and writes back
-4. Rebuilds request body to match what the Codex backend expects (pi-ai's `buildRequestBody` format)
-5. Forwards to `chatgpt.com/backend-api/codex/responses` with required headers (`originator`, `chatgpt-account-id`, `OpenAI-Beta`)
-6. Streams SSE response back to the client
+2. Checks JWT expiry before forwarding
+3. Refreshes token if needed and writes back to `auth.json`
+4. Converts request payload to Codex responses format
+5. Proxies to `chatgpt.com/backend-api/codex/responses`
+6. Streams SSE response back to the caller
 
 ## License
 

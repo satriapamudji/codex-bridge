@@ -16,6 +16,7 @@ const UPSTREAM_TIMEOUT_MS = 120_000;
 const BODY_MAX_BYTES = 10 * 1024 * 1024;
 const BODY_TIMEOUT_MS = 30_000;
 const IDLE_SHUTDOWN_MS = parseInt(process.env.CODEX_BRIDGE_IDLE_MIN || "10") * 60_000;
+const DEFAULT_MODEL = "gpt-5.4";
 
 // --- State ---
 const state = {
@@ -254,12 +255,86 @@ function jsonRes(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+function toTextValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (!part) return "";
+        if (typeof part === "string") return part;
+        if (typeof part.text === "string") return part.text;
+        return JSON.stringify(part);
+      })
+      .filter((item) => item !== "")
+      .join("\n");
+  }
+  return JSON.stringify(value);
+}
+
+function extractSystemPrompt(messages) {
+  if (!Array.isArray(messages)) return "";
+  return messages
+    .filter((m) => m && m.role === "system" && m.content != null)
+    .map((m) => toTextValue(m.content))
+    .join("\n\n");
+}
+
+function messagesToInput(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+  const items = [];
+  for (const msg of messages) {
+    if (!msg || !msg.role || msg.role === "system" || msg.content == null) continue;
+    const text = toTextValue(msg.content);
+    if (!text) continue;
+    items.push({
+      role: msg.role,
+      content: [{ type: "input_text", text }],
+    });
+  }
+  return items;
+}
+
+function buildResponsesPayload(src) {
+  const input = src.input ?? messagesToInput(src.messages);
+
+  const patched = {
+    model: src.model || DEFAULT_MODEL,
+    store: false,
+    stream: true,
+    input,
+    text: src.text || { verbosity: "medium" },
+    include: ["reasoning.encrypted_content"],
+    tool_choice: src.tool_choice ?? "auto",
+    parallel_tool_calls: src.parallel_tool_calls ?? true,
+  };
+
+  patched.instructions =
+    src.instructions || extractSystemPrompt(src.messages) || "You are a helpful assistant.";
+  if (src.tools) patched.tools = src.tools;
+  if (src.max_tokens !== undefined && src.max_output_tokens === undefined) {
+    patched.max_output_tokens = src.max_tokens;
+  } else if (src.max_output_tokens !== undefined) {
+    patched.max_output_tokens = src.max_output_tokens;
+  }
+  if (src.temperature !== undefined) patched.temperature = src.temperature;
+  if (src.top_p !== undefined) patched.top_p = src.top_p;
+  if (src.reasoning) patched.reasoning = src.reasoning;
+  if (src.stop !== undefined) patched.stop = src.stop;
+
+  return patched;
+}
+
 // --- Server ---
 
 const server = createServer(async (req, res) => {
   resetIdleTimer();
+  const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
+  const path = url.pathname;
+  const isResponses = path === "/v1/responses";
+  const isChatCompletions = path === "/v1/chat/completions";
 
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "GET" && path === "/health") {
     try {
       loadAuth();
     } catch (e) {
@@ -273,7 +348,7 @@ const server = createServer(async (req, res) => {
     });
   }
 
-  if (req.method === "GET" && req.url === "/v1/models") {
+  if (req.method === "GET" && path === "/v1/models") {
     return jsonRes(res, 200, {
       object: "list",
       data: [
@@ -293,6 +368,7 @@ const server = createServer(async (req, res) => {
   }
 
   let body;
+  let parsedBody = null;
   try {
     body = await readBody(req);
   } catch (e) {
@@ -300,38 +376,29 @@ const server = createServer(async (req, res) => {
     return jsonRes(res, 400, { error: { message: e.message } });
   }
 
-  let upstreamPath = req.url;
+  let upstreamPath = path;
   if (upstreamPath.startsWith("/v1/")) {
     upstreamPath = "/backend-api/codex/" + upstreamPath.slice(4);
   } else if (upstreamPath === "/v1") {
     upstreamPath = "/backend-api/codex";
   }
 
-  if (body.length > 0 && upstreamPath.endsWith("/responses")) {
+  if (body.length > 0 && (isResponses || isChatCompletions)) {
     try {
-      const src = JSON.parse(body.toString("utf8"));
+      parsedBody = JSON.parse(body.toString("utf8"));
+      if (parsedBody.stream === false) {
+        log("stream=false was received; forcing stream=true for responses compatibility");
+      }
 
-      const patched = {
-        model: src.model,
-        store: false,
-        stream: true,
-        input: src.input,
-        text: src.text || { verbosity: "medium" },
-        include: ["reasoning.encrypted_content"],
-        tool_choice: src.tool_choice ?? "auto",
-        parallel_tool_calls: src.parallel_tool_calls ?? true,
-      };
-
-      // Codex backend requires instructions (system prompt) — default if missing
-      patched.instructions = src.instructions || "You are a helpful assistant.";
-      if (src.tools) patched.tools = src.tools;
-      if (src.temperature !== undefined) patched.temperature = src.temperature;
-      if (src.reasoning) patched.reasoning = src.reasoning;
-
+      if (isChatCompletions) upstreamPath = "/backend-api/codex/responses";
+      const patched = buildResponsesPayload(parsedBody);
       body = Buffer.from(JSON.stringify(patched), "utf8");
-      log(`patched: model=${patched.model} keys=[${Object.keys(patched)}]`);
+      log(`${isChatCompletions ? "patched chat completion" : "patched responses"}: model=${patched.model}`);
     } catch (e) {
-      log(`body patch skipped: ${e.message}`);
+      log(`body patch failed: ${e.message}`);
+      return jsonRes(res, 400, {
+        error: { message: `invalid JSON body: ${e.message}` },
+      });
     }
   }
 

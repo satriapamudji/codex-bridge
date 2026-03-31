@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Local proxy that routes OpenAI Responses API requests through your Codex/ChatGPT subscription with auto token refresh",
   "scripts": {
-    "start": "node bridge.mjs"
+    "start": "node bridge.mjs",
+    "migrate:factory": "node scripts/migrate-factory.mjs"
   },
   "engines": {
     "node": ">=18.0.0"
