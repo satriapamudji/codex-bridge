@@ -1,6 +1,6 @@
 # codex-bridge
 
-Local proxy that routes OpenAI Responses API requests through your Codex/ChatGPT subscription. Zero dependencies — just Node.js.
+Local proxy that routes OpenAI Responses API requests through your Codex/ChatGPT subscription. Zero dependencies - just Node.js.
 
 ## Requirements
 
@@ -92,9 +92,10 @@ droid() {
 
 Both wrappers now:
 
-- reuse an already-running bridge by checking `/health`
-- start a new bridge only if `/health` is unreachable
+- reuse an already-running bridge by checking `/_bridge_status` (startup probe only)
+- start a new bridge only if `/_bridge_status` is unreachable
 - only stop the bridge they started
+- preserve bridge ownership across droids via a per-launch `CODEX_BRIDGE_OWNER_ID` value so one droid can’t kill a bridge owned by another launcher
 
 ## Environment variables
 
@@ -102,12 +103,16 @@ Both wrappers now:
 |---|---|---|
 | `CODEX_BRIDGE_PORT` | `18080` | Proxy listen port |
 | `CODEX_DROID_CMD` | (auto-detected) | Optional explicit `droid` command used by `droid.ps1` |
+| `CODEX_BRIDGE_IDLE_MIN` | `0` | Auto-stop delay in minutes after droid exits; set to `0` to disable |
+
+`droid.ps1`, `droid.sh`, and `ensure.cmd` force `CODEX_BRIDGE_IDLE_MIN=0` when they start bridge.
 
 ## Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Token status + expiry |
+| `GET` | `/_bridge_status` | Lightweight process health, owner token, request counters, and last error details |
 | `GET` | `/v1/models` | Available models |
 | `POST` | `/v1/responses` | Proxied request to Codex backend |
 
@@ -117,6 +122,21 @@ Bridge logs are written to `~/.codex/bridge.log`.
 
 - Linux/macOS: `tail -f ~/.codex/bridge.log`
 - `systemd` services: `journalctl -u <service> -f` for process lifecycle + `~/.codex/bridge.log` for request logs.
+
+Useful startup/log checks:
+
+```bash
+curl -s http://127.0.0.1:18080/_bridge_status | jq
+tail -f ~/.codex/bridge.log
+```
+
+If you see BYOK 400s for `gpt-5` models, check that `~/.factory/settings.json` has:
+
+```text
+provider: openai
+baseUrl: http://127.0.0.1:18080/v1
+apiKey: codex-bridge
+```
 
 ## How it works
 
