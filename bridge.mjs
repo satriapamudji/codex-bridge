@@ -14,6 +14,7 @@ const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const REFRESH_BUFFER_SEC = 120;
 const UPSTREAM_TIMEOUT_MS = 120_000;
 const BODY_MAX_BYTES = 10 * 1024 * 1024;
+const UPSTREAM_ERROR_BODY_MAX_BYTES = 120_000;
 const BODY_TIMEOUT_MS = 30_000;
 const IDLE_SHUTDOWN_MS = parseInt(process.env.CODEX_BRIDGE_IDLE_MIN || "10") * 60_000;
 const DEFAULT_MODEL = "gpt-5.4";
@@ -249,6 +250,28 @@ function readBody(req) {
   });
 }
 
+function collectStreamBody(stream) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+
+    stream.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= UPSTREAM_ERROR_BODY_MAX_BYTES) {
+        chunks.push(chunk);
+      }
+    });
+
+    stream.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+
+    stream.on("error", () => {
+      resolve("");
+    });
+  });
+}
+
 function jsonRes(res, status, obj) {
   if (res.headersSent) return;
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -441,8 +464,51 @@ const server = createServer(async (req, res) => {
         if (!skip.has(k.toLowerCase())) fwd[k] = v;
       }
 
-      log(`← ${upstreamRes.statusCode}`);
-      res.writeHead(upstreamRes.statusCode, fwd);
+      const statusCode = upstreamRes.statusCode || 500;
+      const upstreamCt = (upstreamRes.headers["content-type"] || "").toLowerCase();
+
+      log(`← ${statusCode}`);
+      if (statusCode >= 400) {
+        collectStreamBody(upstreamRes)
+          .then((rawBody) => {
+            const normalizedBody = rawBody || "";
+            const safeBody =
+              normalizedBody.length > 2000 ? `${normalizedBody.slice(0, 2000)}...` : normalizedBody;
+            log(`upstream error body: ${safeBody || "<empty>"}`);
+
+            if (res.headersSent || res.writableEnded || res.destroyed) {
+              return;
+            }
+
+            if (upstreamCt.includes("application/json")) {
+              try {
+                const parsed = JSON.parse(normalizedBody || "{}");
+                res.writeHead(statusCode, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(parsed));
+                return;
+              } catch {
+                // keep fallback below
+              }
+            }
+
+            res.writeHead(statusCode, { "Content-Type": upstreamCt || "application/json" });
+            if (normalizedBody) {
+              res.end(normalizedBody);
+            } else {
+              res.end(JSON.stringify({ error: { message: `upstream returned ${statusCode} with empty body` } }));
+            }
+          })
+          .catch(() => {
+            if (!res.writableEnded && !res.headersSent) {
+              log("failed to read upstream error body");
+              res.writeHead(statusCode, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: { message: `upstream returned ${statusCode}` } }));
+            }
+          });
+        return;
+      }
+
+      res.writeHead(statusCode, fwd);
       upstreamRes.pipe(res);
     }
   );
